@@ -1,0 +1,4 @@
+ntplib
+Flask
+requests
+uwsgi

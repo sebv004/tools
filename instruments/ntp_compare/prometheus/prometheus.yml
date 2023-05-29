@@ -1,0 +1,22 @@
+global:
+  scrape_interval:     5s
+  evaluation_interval: 10s
+
+alerting:
+  alertmanagers:
+  - static_configs:
+    - targets:
+
+rule_files:
+
+scrape_configs:
+  - job_name: ntptest
+    metrics_path: /time-difference
+    params:
+      ntp_server1: [cturra]
+      ntp_server2: [cturra]
+      num_iterations: [4]
+    static_configs:
+      - targets:
+        - ntptest:5000
+  

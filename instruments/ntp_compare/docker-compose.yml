@@ -1,0 +1,32 @@
+version: "3.3"
+
+services:
+
+    cturra:
+        image: cturra/ntp
+        restart: unless-stopped
+        
+    ntptest:
+        image: sebv004/ntptest:1.0.0
+        restart: unless-stopped
+        ports:
+            - "5000:5000"
+
+    prometheus:
+        image: prom/prometheus:latest
+        restart: unless-stopped
+        ports:
+            - "9090:9090"
+        volumes:
+            - prometheus-data:/prometheus
+            - ./prometheus:/app.cfg
+        command: >-
+            --config.file=/app.cfg/prometheus.yml
+            --storage.tsdb.path=/prometheus
+            --web.console.libraries=/usr/share/prometheus/console_libraries
+            --web.console.templates=/usr/share/prometheus/consoles
+            --storage.tsdb.retention.time=7d
+
+volumes:
+  prometheus-data: {}
+
