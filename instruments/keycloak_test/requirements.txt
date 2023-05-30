@@ -1,0 +1,6 @@
+Flask
+prometheus_client
+uwsgi
+requests
+pyjwt==2.3.0
+cryptography
