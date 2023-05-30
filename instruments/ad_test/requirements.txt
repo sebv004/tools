@@ -1,0 +1,4 @@
+python-ldap
+Flask
+requests
+uwsgi
