@@ -1,0 +1,743 @@
+#!/usr/bin/env bash
+#
+# exo-imapcopy — copy mail between two Exchange Online mailboxes over IMAP.
+#
+# Two ways to sign in:
+#   app mode (default)  an app registration acts on its own behalf. Silent,
+#                       scriptable, needs IMAP.AccessAsApp + admin consent +
+#                       New-ServicePrincipal + Add-MailboxPermission.
+#   --delegated         you sign in as an admin user with a device code. Needs
+#                       IMAP.AccessAsUser.All and FullAccess on both mailboxes,
+#                       but no service principal and no tenant-wide consent.
+#
+# Run 'exo-imapcopy --setup' for the one-time tenant setup in either mode.
+
+set -euo pipefail
+
+CONFIG="${EXO_IMAPCOPY_CONFIG:-$HOME/.config/exo-imapcopy.env}"
+IMAP_HOST="outlook.office365.com"
+IMAP_PORT=993
+GO=0
+DIAG=0
+RELOGIN=0
+MOVEUIDS=0
+MODE_OVERRIDE=""
+EXTRA_ARGS=()
+
+# ---------- output helpers ----------
+
+if [[ -t 1 ]]; then
+    B=$'\e[1m'; DIM=$'\e[2m'; GRN=$'\e[32m'; YLW=$'\e[33m'; RED=$'\e[31m'; RST=$'\e[0m'
+else
+    B=""; DIM=""; GRN=""; YLW=""; RED=""; RST=""
+fi
+
+say()   { printf '%s\n' "$*"; }
+head2() { printf '\n%s%s%s\n' "$B" "$*" "$RST"; }
+ok()    { printf '%s✓%s %s\n' "$GRN" "$RST" "$*"; }
+warn()  { printf '%s!%s %s\n' "$YLW" "$RST" "$*"; }
+die()   { printf '%s✗ error:%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'USAGE'
+exo-imapcopy — copy mail between two Exchange Online mailboxes.
+
+Usage:
+  exo-imapcopy               Ask for details, then dry run (nothing is written)
+  exo-imapcopy --go          Ask for details, then actually copy
+  exo-imapcopy --delegated   Sign in as a user with a device code
+  exo-imapcopy --app         Sign in as the app itself (default)
+  exo-imapcopy --relogin     Forget the cached login and sign in again
+  exo-imapcopy --move-uids   Move a UID range from one folder to another in ONE
+                             mailbox. Repairs messages copied to the wrong place.
+  exo-imapcopy --diag        Sign in, show what the token is allowed to do, stop
+  exo-imapcopy --setup       Print the one-time tenant setup steps
+  exo-imapcopy --reset       Forget saved settings and cached login
+  exo-imapcopy --help        This message
+
+  exo-imapcopy -- --maxage 30     Pass extra options straight to imapsync
+
+Answers are remembered in ~/.config/exo-imapcopy.env so you only type them once.
+USAGE
+}
+
+setup_help() {
+    cat <<'SETUP'
+One-time tenant setup
+=====================
+
+Both modes need an app registration, because OAuth needs a client ID. Pick the
+mode that matches the rights you actually have.
+
+  app mode        the app itself gets rights over the two mailboxes.
+                  Needs an admin to consent to an APPLICATION permission.
+  delegated mode  you sign in as an admin user and act as yourself.
+                  No tenant-wide consent, no service principal.
+
+Common steps (both modes)
+-------------------------
+1. Go to https://entra.microsoft.com and sign in with your Microsoft 365 admin
+   account. App registrations are in the free tier of every M365 tenant — no
+   Azure subscription needed. Can't find it? admin.microsoft.com > Show all >
+   Admin centers > Identity.
+
+2. Identity > Applications > App registrations > New registration
+     Name: exo-imapcopy     Single tenant     No redirect URI
+
+3. From the app's Overview page, copy:
+     Application (client) ID   -> answer for "App (client) ID"
+     Directory (tenant) ID     -> answer for "Tenant ID"
+
+Then follow ONE of the two sections below.
+
+
+app mode
+--------
+4a. Certificates & secrets > New client secret > copy the VALUE immediately
+    (shown once only; the Secret ID column is NOT what you want).
+
+5a. API permissions > Add a permission > "APIs my organization uses" tab
+    > Office 365 Exchange Online > Application permissions
+    > tick IMAP.AccessAsApp > Add > then "Grant admin consent".
+
+6a. Enterprise applications > exo-imapcopy > Overview > copy the Object ID.
+    This is NOT the Object ID shown on the App registrations page.
+
+7a. In pwsh:
+
+      Connect-ExchangeOnline -UserPrincipalName you@yourdomain
+
+      New-ServicePrincipal -AppId <client-id> -ObjectId <sp-object-id> `
+        -DisplayName "exo-imapcopy"
+
+      Add-MailboxPermission -Identity <source-mailbox> `
+        -User <sp-object-id> -AccessRights FullAccess
+      Add-MailboxPermission -Identity <target-mailbox> `
+        -User <sp-object-id> -AccessRights FullAccess
+
+    Grant FullAccess on only these two mailboxes. Granted broadly, this app
+    becomes a tenant-wide mail-reading credential.
+
+
+delegated mode
+--------------
+4b. Authentication > Advanced settings > "Allow public client flows" = Yes.
+    Device code sign-in does not work without this.
+
+5b. Usually NOTHING to do here. Delegated scopes are consented when you sign
+    in, so the scope
+
+      https://outlook.office.com/IMAP.AccessAsUser.All
+
+    does not have to be pre-registered under API permissions. Just run
+    'exo-imapcopy --delegated --diag' and approve the consent prompt.
+
+    Pre-register it only if your tenant blocks user consent:
+      API permissions > Add a permission > "APIs my organization uses" tab
+      > Office 365 Exchange Online > Delegated permissions > expand the IMAP
+      group > tick IMAP.AccessAsUser.All > Add > Grant admin consent.
+    Note the permission lives in a collapsible IMAP group; typing the
+    permission name into either search box finds nothing, because those boxes
+    match API names and group names, not permissions.
+
+    No client secret is needed in this mode.
+
+6b. Give your admin account FullAccess to both mailboxes. Being a Global or
+    Exchange admin does NOT by itself grant access to mailbox contents.
+
+      Connect-ExchangeOnline -UserPrincipalName you@yourdomain
+
+      Add-MailboxPermission -Identity <source-mailbox> `
+        -User <your-admin-upn> -AccessRights FullAccess
+      Add-MailboxPermission -Identity <target-mailbox> `
+        -User <your-admin-upn> -AccessRights FullAccess
+
+
+Both modes: check IMAP is switched on
+-------------------------------------
+      Get-CASMailbox -Identity <mailbox> | Format-List ImapEnabled
+      Set-CASMailbox -Identity <mailbox> -ImapEnabled $true    # if needed
+SETUP
+}
+
+# ---------- arguments ----------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --go)         GO=1; shift ;;
+        --diag)       DIAG=1; shift ;;
+        --relogin)    RELOGIN=1; shift ;;
+        --move-uids)  MOVEUIDS=1; shift ;;
+        --delegated)  MODE_OVERRIDE=delegated; shift ;;
+        --app)        MODE_OVERRIDE=app; shift ;;
+        --setup)      setup_help; exit 0 ;;
+        --reset)      rm -f "$CONFIG"; ok "Forgot saved settings ($CONFIG)"; exit 0 ;;
+        --help|-h)    usage; exit 0 ;;
+        --)           shift; EXTRA_ARGS=("$@"); break ;;
+        *)            printf '%sUnknown option: %s%s\n\n' "$RED" "$1" "$RST" >&2
+                      usage >&2; exit 2 ;;
+    esac
+done
+
+for dep in imapsync curl jq; do
+    command -v "$dep" >/dev/null || die "$dep is not installed. Try: brew install $dep"
+done
+
+# ---------- prompt helpers ----------
+
+ask() {
+    local __var=$1 __q=$2 __def=${3:-} __ans
+    if [[ -n "$__def" ]]; then
+        read -rp "$__q ${DIM}[$__def]${RST}: " __ans
+        __ans=${__ans:-$__def}
+    else
+        read -rp "$__q: " __ans
+    fi
+    printf -v "$__var" '%s' "$__ans"
+}
+
+ask_secret() {
+    local __var=$1 __q=$2 __ans
+    read -rsp "$__q: " __ans; echo
+    printf -v "$__var" '%s' "$__ans"
+}
+
+valid_upn() { [[ "$1" == *@*.* && "$1" != *" "* ]]; }
+
+b64url_decode() {
+    local d=$1
+    d=${d//-/+}; d=${d//_//}
+    case $(( ${#d} % 4 )) in 2) d="$d==" ;; 3) d="$d=" ;; esac
+    printf '%s' "$d" | base64 -d 2>/dev/null
+}
+
+# ---------- load saved settings ----------
+
+if [[ -f "$CONFIG" ]]; then
+    perms=$(stat -c '%a' "$CONFIG")
+    [[ "$perms" == "600" ]] || die "$CONFIG is readable by others (mode $perms). Fix with: chmod 600 $CONFIG"
+    # shellcheck disable=SC1090
+    set -a; source "$CONFIG"; set +a
+    ok "Loaded saved settings from $CONFIG"
+fi
+
+MODE=${MODE_OVERRIDE:-${EXO_MODE:-app}}
+
+# An explicit --app/--delegated sticks straight away, so a later run without the
+# flag doesn't silently fall back to the mode the config was last written with.
+if [[ -n "$MODE_OVERRIDE" && -f "$CONFIG" ]]; then
+    if grep -q '^EXO_MODE=' "$CONFIG"; then
+        sed -i "s/^EXO_MODE=.*/EXO_MODE=$MODE/" "$CONFIG"
+    else
+        printf 'EXO_MODE=%s\n' "$MODE" >> "$CONFIG"
+    fi
+fi
+
+say
+say "${B}Copy mail between two Microsoft 365 mailboxes${RST}"
+say "${DIM}Press Enter to accept a [suggested] answer. Ctrl-C to quit.${RST}"
+if [[ "$MODE" == "delegated" ]]; then
+    say "${DIM}Sign-in: delegated — you log in as a user with a device code.${RST}"
+else
+    say "${DIM}Sign-in: app — the app registration acts on its own. Use --delegated to switch.${RST}"
+fi
+say "${DIM}Never done the tenant setup? Quit and run: exo-imapcopy --setup${RST}"
+
+# ---------- credentials ----------
+
+head2 "1. Microsoft 365 app credentials"
+
+ask EXO_TENANT_ID "Tenant ID" "${EXO_TENANT_ID:-}"
+[[ -n "$EXO_TENANT_ID" ]] || die "Tenant ID is required. See: exo-imapcopy --setup"
+
+ask EXO_APP_ID "App (client) ID" "${EXO_APP_ID:-}"
+[[ -n "$EXO_APP_ID" ]] || die "App ID is required. See: exo-imapcopy --setup"
+
+if [[ "$MODE" == "app" ]]; then
+    if [[ -n "${EXO_APP_SECRET:-}" ]]; then
+        ok "Using saved client secret"
+    else
+        ask_secret EXO_APP_SECRET "App client secret ${DIM}(hidden)${RST}"
+        [[ -n "$EXO_APP_SECRET" ]] || die "Client secret is required. See: exo-imapcopy --setup"
+    fi
+else
+    say "${DIM}No client secret needed in delegated mode.${RST}"
+fi
+
+# ---------- what to copy ----------
+
+if (( DIAG == 0 && MOVEUIDS == 0 )); then
+    head2 "2. What to copy"
+
+    while :; do
+        ask SRC_USER "Copy FROM which mailbox" "${SRC_USER:-}"
+        valid_upn "$SRC_USER" && break
+        warn "That doesn't look like an email address. Try again."
+    done
+
+    while :; do
+        ask DST_USER "Copy TO which mailbox" "${DST_USER:-}"
+        if ! valid_upn "$DST_USER"; then
+            warn "That doesn't look like an email address. Try again."
+        elif [[ "${DST_USER,,}" == "${SRC_USER,,}" ]]; then
+            warn "Source and target are the same mailbox. Try again."
+        else
+            break
+        fi
+    done
+
+    say
+    say "Which folders from ${B}$SRC_USER${RST}?"
+    say "  1) Everything"
+    say "  2) Just one folder (e.g. INBOX)"
+    ask which_folders "Choice" "${which_folders:-1}"
+
+    if [[ "$which_folders" == "2" ]]; then
+        ask SRC_FOLDER "Folder name" "${SRC_FOLDER:-INBOX}"
+        [[ -n "$SRC_FOLDER" ]] || die "Folder name is required"
+    else
+        SRC_FOLDER=""
+    fi
+
+    while :; do
+        ask DST_FOLDER "Put the copies in which NEW folder in $DST_USER" "${DST_FOLDER:-Imported}"
+        [[ -n "$DST_FOLDER" ]] && break
+        warn "A target folder name is required."
+    done
+
+    FLATTEN=1
+    if [[ -z "$SRC_FOLDER" ]]; then
+        say
+        say "You're copying every folder. How should they land inside ${B}$DST_FOLDER${RST}?"
+        say "  1) All messages together in $DST_FOLDER"
+        say "  2) Keep the original folder names, nested under $DST_FOLDER/"
+        ask layout "Choice" "${layout:-1}"
+        [[ "$layout" == "2" ]] && FLATTEN=0
+
+        # Calendar, Contacts, Tasks and friends are visible over IMAP but their
+        # items are not mail, so copying them produces errors or junk.
+        say
+        say "Skip the non-mail folders? ${DIM}(Calendar, Contacts, Tasks, Notes,${RST}"
+        say "${DIM}Journal, Outbox, Conversation History)${RST}"
+        say "  1) Yes, mail folders only ${DIM}(recommended)${RST}"
+        say "  2) No, try to copy everything"
+        ask skip_nonmail "Choice" "${skip_nonmail:-1}"
+    fi
+
+    head2 "3. Remember these answers?"
+    if [[ "$MODE" == "app" ]]; then
+        say "  1) Yes, including the client secret ${DIM}(file is mode 600)${RST}"
+        say "  2) Yes, but ask for the secret each time"
+        say "  3) No"
+    else
+        say "  1) Yes, and stay signed in ${DIM}(caches a refresh token, file is mode 600)${RST}"
+        say "  2) Yes, but sign in with a device code each time"
+        say "  3) No"
+    fi
+    ask save_choice "Choice" "2"
+else
+    save_choice=0
+fi
+
+if (( MOVEUIDS == 1 )); then
+    head2 "2. What to move"
+    while :; do
+        ask MV_USER "In which mailbox" "${DST_USER:-}"
+        valid_upn "$MV_USER" && break
+        warn "That doesn't look like an email address. Try again."
+    done
+    ask MV_SRC "Move OUT of which folder" "INBOX"
+    ask MV_DST "Move INTO which folder" "${DST_FOLDER:-}/INBOX"
+    ask MV_FROM "Lowest UID to move (everything from here up)" ""
+    [[ "$MV_FROM" =~ ^[0-9]+$ ]] || die "UID must be a number"
+fi
+
+# ---------- sign in ----------
+
+TOKEN_FILE=$(mktemp -t exo-imapcopy-token.XXXXXX)
+chmod 600 "$TOKEN_FILE"
+trap 'rm -f "$TOKEN_FILE"' EXIT INT TERM
+
+TOKEN_URL="https://login.microsoftonline.com/${EXO_TENANT_ID}/oauth2/v2.0/token"
+DEVICE_URL="https://login.microsoftonline.com/${EXO_TENANT_ID}/oauth2/v2.0/devicecode"
+DELEGATED_SCOPE="https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+
+head2 "4. Signing in"
+
+access_token=""
+new_refresh_token=""
+
+signin_failed() {
+    local body=$1 desc
+    desc=$(jq -r '.error_description // empty' <<<"$body" 2>/dev/null || true)
+    say
+    die "Sign-in failed.
+${desc:-$body}
+
+Common causes:
+  - Tenant ID or App ID mistyped
+  - app mode: client secret expired, or admin consent not granted for
+    IMAP.AccessAsApp
+  - delegated mode: 'Allow public client flows' is not enabled on the app
+    (Authentication > Advanced settings), or IMAP.AccessAsUser.All is missing
+Run 'exo-imapcopy --setup' to re-check the steps."
+}
+
+if [[ "$MODE" == "app" ]]; then
+    body=$(curl -sS -X POST "$TOKEN_URL" \
+        --data-urlencode "client_id=${EXO_APP_ID}" \
+        --data-urlencode "client_secret=${EXO_APP_SECRET}" \
+        --data-urlencode "scope=https://${IMAP_HOST}/.default" \
+        --data-urlencode "grant_type=client_credentials" 2>&1) || true
+    access_token=$(jq -r '.access_token // empty' <<<"$body" 2>/dev/null || true)
+    [[ -n "$access_token" ]] || signin_failed "$body"
+    ok "Signed in as the app"
+else
+    # Try the cached refresh token first so repeat runs are silent.
+    if (( RELOGIN == 1 )); then
+        EXO_REFRESH_TOKEN=""
+        say "Signing in again as requested."
+    fi
+    if [[ -n "${EXO_REFRESH_TOKEN:-}" ]]; then
+        say "Trying saved login..."
+        body=$(curl -sS -X POST "$TOKEN_URL" \
+            --data-urlencode "client_id=${EXO_APP_ID}" \
+            --data-urlencode "refresh_token=${EXO_REFRESH_TOKEN}" \
+            --data-urlencode "scope=${DELEGATED_SCOPE}" \
+            --data-urlencode "grant_type=refresh_token" 2>&1) || true
+        access_token=$(jq -r '.access_token // empty' <<<"$body" 2>/dev/null || true)
+        if [[ -n "$access_token" ]]; then
+            new_refresh_token=$(jq -r '.refresh_token // empty' <<<"$body" 2>/dev/null || true)
+            ok "Reused saved login"
+        else
+            warn "Saved login has expired. Signing in again."
+        fi
+    fi
+
+    if [[ -z "$access_token" ]]; then
+        body=$(curl -sS -X POST "$DEVICE_URL" \
+            --data-urlencode "client_id=${EXO_APP_ID}" \
+            --data-urlencode "scope=${DELEGATED_SCOPE}" 2>&1) || true
+        device_code=$(jq -r '.device_code // empty' <<<"$body" 2>/dev/null || true)
+        [[ -n "$device_code" ]] || signin_failed "$body"
+
+        user_code=$(jq -r '.user_code' <<<"$body")
+        verify_uri=$(jq -r '.verification_uri' <<<"$body")
+        interval=$(jq -r '.interval // 5' <<<"$body")
+        expires_in=$(jq -r '.expires_in // 900' <<<"$body")
+
+        say
+        say "  Open ${B}${verify_uri}${RST}"
+        say "  Enter this code: ${B}${user_code}${RST}"
+        say "  Sign in as an admin who has FullAccess to both mailboxes."
+        say
+        printf '  Waiting for you to finish signing in'
+
+        deadline=$(( $(date +%s) + expires_in ))
+        while :; do
+            sleep "$interval"
+            printf '.'
+            body=$(curl -sS -X POST "$TOKEN_URL" \
+                --data-urlencode "client_id=${EXO_APP_ID}" \
+                --data-urlencode "device_code=${device_code}" \
+                --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" 2>&1) || true
+            access_token=$(jq -r '.access_token // empty' <<<"$body" 2>/dev/null || true)
+            if [[ -n "$access_token" ]]; then
+                new_refresh_token=$(jq -r '.refresh_token // empty' <<<"$body" 2>/dev/null || true)
+                say; break
+            fi
+            err=$(jq -r '.error // empty' <<<"$body" 2>/dev/null || true)
+            case "$err" in
+                authorization_pending) ;;
+                slow_down) interval=$(( interval + 5 )) ;;
+                ""|authorization_declined|expired_token|bad_verification_code)
+                    say; signin_failed "$body" ;;
+                *) say; signin_failed "$body" ;;
+            esac
+            if (( $(date +%s) > deadline )); then
+                say; die "Timed out waiting for sign-in."
+            fi
+        done
+        ok "Signed in"
+    fi
+fi
+
+printf '%s' "$access_token" > "$TOKEN_FILE"
+
+# ---------- inspect the token ----------
+
+claims=$(b64url_decode "$(cut -d. -f2 <<<"$access_token")" || true)
+tok_roles=$(jq -r '.roles // [] | join(", ")' <<<"$claims" 2>/dev/null || true)
+tok_scp=$(jq -r '.scp // ""' <<<"$claims" 2>/dev/null || true)
+tok_app=$(jq -r '.appid // .azp // "?"' <<<"$claims" 2>/dev/null || true)
+tok_upn=$(jq -r '.upn // .preferred_username // ""' <<<"$claims" 2>/dev/null || true)
+tok_aud=$(jq -r '.aud // "?"' <<<"$claims" 2>/dev/null || true)
+unset access_token EXO_APP_SECRET
+
+if [[ "$MODE" == "app" ]]; then
+    NEEDED="IMAP.AccessAsApp"; GRANTED="$tok_roles"; GRANT_LABEL="Roles"
+else
+    NEEDED="IMAP.AccessAsUser.All"; GRANTED="$tok_scp"; GRANT_LABEL="Scopes"
+fi
+
+# ---------- save settings ----------
+
+if [[ "$save_choice" == "1" || "$save_choice" == "2" ]]; then
+    mkdir -p "$(dirname "$CONFIG")"
+    umask 077
+    {
+        echo "# Written by exo-imapcopy on $(date -Iseconds)"
+        echo "EXO_MODE=$MODE"
+        echo "EXO_TENANT_ID=$EXO_TENANT_ID"
+        echo "EXO_APP_ID=$EXO_APP_ID"
+        if [[ "$save_choice" == "1" ]]; then
+            [[ "$MODE" == "app" && -n "${EXO_APP_SECRET:-}" ]] && echo "EXO_APP_SECRET=$EXO_APP_SECRET"
+            if [[ "$MODE" == "delegated" ]]; then
+                rt=${new_refresh_token:-${EXO_REFRESH_TOKEN:-}}
+                [[ -n "$rt" ]] && echo "EXO_REFRESH_TOKEN=$rt"
+            fi
+        fi
+        echo "SRC_USER=$SRC_USER"
+        echo "DST_USER=$DST_USER"
+        echo "SRC_FOLDER=$SRC_FOLDER"
+        echo "DST_FOLDER=$DST_FOLDER"
+        echo "which_folders=$which_folders"
+        echo "layout=${layout:-1}"
+        echo "skip_nonmail=${skip_nonmail:-1}"
+    } > "$CONFIG"
+    chmod 600 "$CONFIG"
+    ok "Saved to $CONFIG"
+fi
+
+# ---------- diag mode stops here ----------
+
+if (( DIAG == 1 )); then
+    head2 "What this token is allowed to do"
+    printf '  Mode       %s\n' "$MODE"
+    printf '  App ID     %s\n' "$tok_app"
+    [[ -n "$tok_upn" ]] && printf '  Signed in  %s\n' "$tok_upn"
+    printf '  Audience   %s\n' "$tok_aud"
+    printf '  %-10s %s\n' "$GRANT_LABEL" "${GRANTED:-<none>}"
+    say
+    if [[ "$GRANTED" == *"$NEEDED"* ]]; then
+        ok "$NEEDED is present."
+        say "  The Entra side is done. If IMAP login still fails, it's Exchange-side:"
+        if [[ "$MODE" == "app" ]]; then
+            say "    - New-ServicePrincipal not run for this app"
+            say "    - Add-MailboxPermission FullAccess missing for the app's Object ID"
+        else
+            say "    - ${tok_upn:-your account} lacks FullAccess on one of the mailboxes"
+            say "      (admin roles alone do NOT grant mailbox access)"
+        fi
+        say "    - IMAP switched off on a mailbox (Get-CASMailbox ... ImapEnabled)"
+    else
+        warn "$NEEDED is MISSING from this token."
+        if [[ "$MODE" == "app" ]]; then
+            say "  Redo step 5a of 'exo-imapcopy --setup': add the IMAP.AccessAsApp"
+            say "  application permission and Grant admin consent."
+        else
+            say "  Redo step 5b of 'exo-imapcopy --setup': add the IMAP.AccessAsUser.All"
+            say "  delegated permission."
+        fi
+    fi
+    exit 0
+fi
+
+if [[ "$GRANTED" != *"$NEEDED"* ]]; then
+    warn "This token does not include $NEEDED (${GRANT_LABEL,,}: ${GRANTED:-none})."
+    say "  IMAP login will almost certainly fail. Run 'exo-imapcopy --diag' for detail."
+    say
+    ask cont "Continue anyway? (y/N)" "N"
+    [[ "${cont,,}" == "y" ]] || die "Stopped."
+fi
+
+# ---------- move-uids repair mode ----------
+
+if (( MOVEUIDS == 1 )); then
+    head2 "5. Ready"
+    printf '  Mailbox %s\n' "$MV_USER"
+    printf '  From    %s  (UID >= %s)\n' "$MV_SRC" "$MV_FROM"
+    printf '  Into    %s\n' "$MV_DST"
+    if (( GO == 1 )); then
+        printf '  Mode    %sLIVE — messages will be moved%s\n\n' "$YLW" "$RST"
+    else
+        printf '  Mode    %sdry run — counts only, nothing moved%s\n\n' "$DIM" "$RST"
+    fi
+
+    MV_USER="$MV_USER" MV_SRC="$MV_SRC" MV_DST="$MV_DST" MV_FROM="$MV_FROM" \
+    MV_GO="$GO" MV_TOKEN_FILE="$TOKEN_FILE" MV_HOST="$IMAP_HOST" \
+    python3 <<'PYEOF'
+import imaplib, os, sys
+
+user = os.environ["MV_USER"]
+src  = os.environ["MV_SRC"]
+dst  = os.environ["MV_DST"]
+low  = int(os.environ["MV_FROM"])
+go   = os.environ["MV_GO"] == "1"
+host = os.environ["MV_HOST"]
+token = open(os.environ["MV_TOKEN_FILE"]).read().strip()
+
+def die(msg):
+    print(f"  error: {msg}", file=sys.stderr); sys.exit(1)
+
+M = imaplib.IMAP4_SSL(host, 993)
+auth = f"user={user}\x01auth=Bearer {token}\x01\x01"
+try:
+    M.authenticate("XOAUTH2", lambda _: auth.encode())
+except imaplib.IMAP4.error as e:
+    die(f"login failed for {user}: {e}")
+
+def quote(name):
+    return '"%s"' % name.replace('\\', '\\\\').replace('"', '\\"')
+
+typ, _ = M.select(quote(src))
+if typ != "OK":
+    die(f"cannot open folder {src!r}")
+
+typ, data = M.uid("SEARCH", None, f"UID {low}:*")
+if typ != "OK":
+    die("UID SEARCH failed")
+uids = [u for u in data[0].split() if int(u) >= low]
+print(f"  {len(uids)} message(s) in {src} with UID >= {low}")
+if not uids:
+    M.logout(); sys.exit(0)
+print(f"  UID range found: {uids[0].decode()} .. {uids[-1].decode()}")
+
+if not go:
+    print("\n  Dry run — nothing moved. Re-run with --go to move them.")
+    M.logout(); sys.exit(0)
+
+# The destination may not exist yet (this mode exists to repair exactly that
+# case), so create it first. CREATE on an existing folder is harmless.
+typ, resp = M.create(quote(dst))
+if typ == "OK":
+    print(f"  created folder {dst}")
+    M.subscribe(quote(dst))
+else:
+    txt = b" ".join(resp).decode(errors="replace").lower()
+    if "already exists" not in txt and "exists" not in txt:
+        die(f"could not create {dst!r}: {resp}")
+
+# MOVE is in the server's advertised capabilities; fall back to COPY+delete.
+moved = 0
+used = set()
+for i in range(0, len(uids), 200):
+    batch = uids[i:i+200]
+    chunk = b",".join(batch).decode()
+    typ, resp = M.uid("MOVE", chunk, quote(dst))
+    if typ == "OK":
+        used.add("MOVE")
+    else:
+        used.add("COPY+delete")
+        typ, resp = M.uid("COPY", chunk, quote(dst))
+        if typ != "OK":
+            die(f"COPY failed: {resp}")
+        typ, resp = M.uid("STORE", chunk, "+FLAGS", "(\\Deleted)")
+        if typ != "OK":
+            die(f"copied to {dst}, but flagging the originals deleted failed: {resp}\n"
+                f"  Messages now exist in BOTH folders. Nothing was lost.")
+        typ, resp = M.expunge()
+        if typ != "OK":
+            die(f"copied and flagged, but EXPUNGE failed: {resp}\n"
+                f"  Messages now exist in BOTH folders. Nothing was lost.")
+    moved += len(batch)
+    print(f"  moved {moved}/{len(uids)}")
+
+print(f"  method used: {', '.join(sorted(used))}")
+
+# Verify: re-select the source and count what is still there.
+M.close()
+M.select(quote(src))
+typ, data = M.uid("SEARCH", None, f"UID {low}:*")
+left = [u for u in data[0].split() if int(u) >= low] if typ == "OK" else []
+typ, data = M.select(quote(dst))
+dst_n = int(data[0]) if typ == "OK" else -1
+M.logout()
+
+print(f"\n  {src}: {len(left)} message(s) with UID >= {low} still present")
+print(f"  {dst}: {dst_n} message(s) total")
+if left:
+    print(f"\n  WARNING: {len(left)} original(s) remain in {src}."
+          f" They are also in {dst}, so nothing was lost, but the source"
+          f" was not cleared.")
+    sys.exit(2)
+print(f"\n  Moved {moved} message(s) from {src} to {dst}.")
+PYEOF
+    rc=$?
+    say
+    if (( rc == 0 )); then
+        (( GO == 1 )) && ok "Move finished." || ok "Dry run finished. Nothing moved."
+    else
+        warn "Move failed with status $rc."
+    fi
+    exit $rc
+fi
+
+# ---------- build the imapsync command ----------
+
+args=(
+    --host1 "$IMAP_HOST" --port1 "$IMAP_PORT" --ssl1
+    --user1 "$SRC_USER" --oauthaccesstoken1 "$TOKEN_FILE"
+    --host2 "$IMAP_HOST" --port2 "$IMAP_PORT" --ssl2
+    --user2 "$DST_USER" --oauthaccesstoken2 "$TOKEN_FILE"
+    --nofoldersizes
+)
+
+if [[ -n "$SRC_FOLDER" ]]; then
+    args+=(--folder "$SRC_FOLDER" --regextrans2 "s{.*}{$DST_FOLDER}")
+elif [[ "$FLATTEN" -eq 1 ]]; then
+    args+=(--regextrans2 "s{.*}{$DST_FOLDER}")
+else
+    # --prefix2 is NOT applied to INBOX (imapsync special-cases it), which would
+    # dump the source Inbox into the target's real Inbox. Prefix every folder
+    # name with a regex instead, and disable the INBOX special case.
+    args+=(--regextrans2 "s{^}{${DST_FOLDER}/}" --nofixInboxINBOX)
+fi
+
+if [[ -z "$SRC_FOLDER" && "${skip_nonmail:-1}" == "1" ]]; then
+    args+=(--exclude '^(Calendar|Contacts|Tasks|Notes|Journal|Outbox|Conversation History)(/|$)')
+fi
+
+(( GO == 1 )) || args+=(--dry)
+[[ ${#EXTRA_ARGS[@]} -gt 0 ]] && args+=("${EXTRA_ARGS[@]}")
+
+# ---------- confirm ----------
+
+head2 "5. Ready"
+nest_note=""
+[[ -z "$SRC_FOLDER" && "$FLATTEN" -eq 0 ]] && nest_note="/  (original folder names kept underneath)"
+printf '  From    %s  %s(%s)%s\n' "$SRC_USER" "$DIM" "${SRC_FOLDER:-all folders}" "$RST"
+printf '  To      %s\n' "$DST_USER"
+printf '  Folder  %s%s\n' "$DST_FOLDER" "$nest_note"
+[[ -n "$tok_upn" ]] && printf '  As      %s\n' "$tok_upn"
+
+if (( GO == 1 )); then
+    printf '  Mode    %sLIVE — messages will be written%s\n\n' "$YLW" "$RST"
+    ask confirm "Type the target mailbox to confirm"
+    [[ "$confirm" == "$DST_USER" ]] || die "That didn't match. Nothing was copied."
+else
+    printf '  Mode    %sdry run — nothing will be written%s\n' "$DIM" "$RST"
+    say "          ${DIM}Re-run with --go once the numbers look right.${RST}"
+fi
+say
+
+# The access token lasts about an hour. imapsync skips messages already present,
+# so if a big copy runs out of time just start it again.
+set +e
+imapsync "${args[@]}"
+rc=$?
+set -e
+
+say
+if (( rc == 0 )); then
+    if (( GO == 1 )); then
+        ok "Done. Copies are in '$DST_FOLDER' in $DST_USER."
+    else
+        ok "Dry run finished. Nothing was written."
+        say "  Run ${B}exo-imapcopy --go${RST} to copy for real."
+    fi
+else
+    warn "imapsync exited with status $rc — see its output above."
+    say "  Login trouble? Run ${B}exo-imapcopy --diag${RST} to see what the token can do."
+fi
+exit $rc
